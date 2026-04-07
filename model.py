@@ -3,6 +3,7 @@ This file contains implementation of SpecRNet architecture.
 We base our codebase on the implementation of RawNet2 by Hemlata Tak (tak@eurecom.fr).
 It is available here: https://github.com/asvspoof-challenge/2021/blob/main/LA/Baseline-RawNet2/model.py
 """
+import copy
 import torch.nn as nn
 
 
@@ -55,7 +56,9 @@ class Residual_block2D(nn.Module):
         else:
             out = x
 
-        out = self.conv1(x)
+        # Use the pre-activated tensor for non-first blocks.
+        # This keeps BN + activation effective before conv1.
+        out = self.conv1(out)
         out = self.bn2(out)
         out = self.lrelu(out)
         out = self.conv2(out)
@@ -71,41 +74,79 @@ class Residual_block2D(nn.Module):
 class SpecRNet(nn.Module):
     def __init__(self, d_args, **kwargs):
         super().__init__()
-
+        # avoid mutating caller config
+        d_args = copy.deepcopy(d_args)
         self.device = kwargs.get("device", "cuda")
+
+        # variant / feature toggles (can be set via config or kwargs)
+        self.variant = kwargs.get("variant", d_args.get("variant", "default"))
+        self.use_attention = kwargs.get("use_attention", d_args.get("use_attention", True))
+        if self.variant in ("no-att", "no_attention"):
+            self.use_attention = False
+        self.head = kwargs.get("head", d_args.get("head", "gru"))
+        # support explicit head variants:
+        # - 'gap' -> global average pooling
+        # - 'last' -> use last time-step features (no GRU)
+        if self.variant in ("gap",):
+            self.head = "gap"
+        if self.variant in ("no-gru", "no_gru", "remove-gru"):
+            self.head = "last"
+        self.use_gap = self.head == "gap"
+        self.use_last = self.head == "last"
 
         self.first_bn = nn.BatchNorm2d(num_features=d_args["filts"][0])
         self.selu = nn.SELU(inplace=True)
-        self.block0 = nn.Sequential(
-            Residual_block2D(nb_filts=d_args["filts"][1], first=True)
-        )
+        self.block0 = nn.Sequential(Residual_block2D(nb_filts=d_args["filts"][1], first=True))
         self.block2 = nn.Sequential(Residual_block2D(nb_filts=d_args["filts"][2]))
+        # ensure filts consistent for block4
         d_args["filts"][2][0] = d_args["filts"][2][1]
         self.block4 = nn.Sequential(Residual_block2D(nb_filts=d_args["filts"][2]))
         self.avgpool = nn.AdaptiveAvgPool2d(1)
 
-        self.fc_attention0 = self._make_attention_fc(
-            in_features=d_args["filts"][1][-1], l_out_features=d_args["filts"][1][-1]
-        )
-        self.fc_attention2 = self._make_attention_fc(
-            in_features=d_args["filts"][2][-1], l_out_features=d_args["filts"][2][-1]
-        )
-        self.fc_attention4 = self._make_attention_fc(
-            in_features=d_args["filts"][2][-1], l_out_features=d_args["filts"][2][-1]
-        )
+        # attention modules (optional)
+        if self.use_attention:
+            self.fc_attention0 = self._make_attention_fc(
+                in_features=d_args["filts"][1][-1], l_out_features=d_args["filts"][1][-1]
+            )
+            self.fc_attention2 = self._make_attention_fc(
+                in_features=d_args["filts"][2][-1], l_out_features=d_args["filts"][2][-1]
+            )
+            self.fc_attention4 = self._make_attention_fc(
+                in_features=d_args["filts"][2][-1], l_out_features=d_args["filts"][2][-1]
+            )
+            self.sig = nn.Sigmoid()
 
         self.bn_before_gru = nn.BatchNorm2d(num_features=d_args["filts"][2][-1])
-        self.gru = nn.GRU(
-            input_size=d_args["filts"][2][-1],
-            hidden_size=d_args["gru_node"],
-            num_layers=d_args["nb_gru_layer"],
-            batch_first=True,
-            bidirectional=True,
-        )
-
-        self.fc1_gru = nn.Linear(
-            in_features=d_args["gru_node"] * 2, out_features=d_args["nb_fc_node"] * 2
-        )
+        # Build head: GRU, GAP, or LAST (no-GRU)
+        if self.head == "gru":
+            self.gru = nn.GRU(
+                input_size=d_args["filts"][2][-1],
+                hidden_size=d_args["gru_node"],
+                num_layers=d_args["nb_gru_layer"],
+                batch_first=True,
+                bidirectional=True,
+            )
+            self.fc1_gru = nn.Linear(
+                in_features=d_args["gru_node"] * 2, out_features=d_args["nb_fc_node"] * 2
+            )
+        elif self.head == "gap":
+            # GAP head: global average over time -> FC
+            self.fc_pool = nn.Linear(in_features=d_args["filts"][2][-1], out_features=d_args["nb_fc_node"] * 2)
+        elif self.head == "last":
+            # LAST head: take last time-step features -> FC (no GRU)
+            self.fc_last = nn.Linear(in_features=d_args["filts"][2][-1], out_features=d_args["nb_fc_node"] * 2)
+        else:
+            # fallback to GRU if unknown head
+            self.gru = nn.GRU(
+                input_size=d_args["filts"][2][-1],
+                hidden_size=d_args["gru_node"],
+                num_layers=d_args["nb_gru_layer"],
+                batch_first=True,
+                bidirectional=True,
+            )
+            self.fc1_gru = nn.Linear(
+                in_features=d_args["gru_node"] * 2, out_features=d_args["nb_fc_node"] * 2
+            )
 
         self.fc2_gru = nn.Linear(
             in_features=d_args["nb_fc_node"] * 2,
@@ -113,50 +154,73 @@ class SpecRNet(nn.Module):
             bias=True,
         )
 
-        self.sig = nn.Sigmoid()
-
     def forward(self, x):
         x = self.first_bn(x)
         x = self.selu(x)
-
+        # Block0 + optional attention
         x0 = self.block0(x)
-        y0 = self.avgpool(x0).view(x0.size(0), -1)
-        y0 = self.fc_attention0(y0)
-        y0 = self.sig(y0).view(y0.size(0), y0.size(1), -1)
-        y0 = y0.unsqueeze(-1)
-        x = x0 * y0 + y0
+        if self.use_attention:
+            y0 = self.avgpool(x0).view(x0.size(0), -1)
+            y0 = self.fc_attention0(y0)
+            y0 = self.sig(y0).view(y0.size(0), y0.size(1), -1)
+            y0 = y0.unsqueeze(-1)
+            x = x0 * y0 + y0
+        else:
+            x = x0
 
         x = nn.MaxPool2d(2)(x)
 
+        # Block2 + optional attention
         x2 = self.block2(x)
-        y2 = self.avgpool(x2).view(x2.size(0), -1)
-        y2 = self.fc_attention2(y2)
-        y2 = self.sig(y2).view(y2.size(0), y2.size(1), -1)
-        y2 = y2.unsqueeze(-1)
-        x = x2 * y2 + y2
+        if self.use_attention:
+            y2 = self.avgpool(x2).view(x2.size(0), -1)
+            y2 = self.fc_attention2(y2)
+            y2 = self.sig(y2).view(y2.size(0), y2.size(1), -1)
+            y2 = y2.unsqueeze(-1)
+            x = x2 * y2 + y2
+        else:
+            x = x2
 
         x = nn.MaxPool2d(2)(x)
 
+        # Block4 + optional attention
         x4 = self.block4(x)
-        y4 = self.avgpool(x4).view(x4.size(0), -1)
-        y4 = self.fc_attention4(y4)
-        y4 = self.sig(y4).view(y4.size(0), y4.size(1), -1)
-        y4 = y4.unsqueeze(-1)
-        x = x4 * y4 + y4
+        if self.use_attention:
+            y4 = self.avgpool(x4).view(x4.size(0), -1)
+            y4 = self.fc_attention4(y4)
+            y4 = self.sig(y4).view(y4.size(0), y4.size(1), -1)
+            y4 = y4.unsqueeze(-1)
+            x = x4 * y4 + y4
+        else:
+            x = x4
 
         x = nn.MaxPool2d(2)(x)
 
+        # Head: BN -> SELU -> squeeze time dim -> GRU or GAP
         x = self.bn_before_gru(x)
         x = self.selu(x)
         x = x.squeeze(-2)
         x = x.permute(0, 2, 1)
-        self.gru.flatten_parameters()
-        x, _ = self.gru(x)
-        x = x[:, -1, :]
-        x = self.fc1_gru(x)
-        x = self.fc2_gru(x)
 
-        return x
+        if self.use_gap:
+            # Global average over time, then FC head
+            x = x.mean(dim=1)
+            x = self.fc_pool(x)
+            x = self.fc2_gru(x)
+            return x
+        elif self.use_last:
+            # Last-time-step head (no GRU)
+            x = x[:, -1, :]
+            x = self.fc_last(x)
+            x = self.fc2_gru(x)
+            return x
+        else:
+            self.gru.flatten_parameters()
+            x, _ = self.gru(x)
+            x = x[:, -1, :]
+            x = self.fc1_gru(x)
+            x = self.fc2_gru(x)
+            return x
 
     def _make_attention_fc(self, in_features, l_out_features):
         l_fc = []

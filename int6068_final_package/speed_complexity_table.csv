@@ -1,0 +1,7 @@
+variant,params,inference_ms_per_sample,notes
+default,278092,1.8655753135681152,paper-aligned baseline
+no-att,269352,1.6267061233520508,attention removed
+gap,136744,0.7573175430297852,temporal head replaced by GAP
+duration_1s_default,278092,1.9405746459960938,short-utterance condition
+weighted_loss_on,278092,2.0314836502075195,class-weighted CE
+weighted_loss_off,278092,1.9024205207824707,control

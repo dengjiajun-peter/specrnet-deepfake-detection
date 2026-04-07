@@ -1,0 +1,17 @@
+{
+  "metadata": "metadata_kaggle.csv",
+  "total_rows": 7472,
+  "split_counts": {
+    "train": 5230,
+    "val": 1121,
+    "test": 1121
+  },
+  "label_counts": {
+    "fake": 6538,
+    "real": 934
+  },
+  "utt_id_multi_split_count": 0,
+  "pair_key_multi_split_count": 64,
+  "source_speaker_multi_split_count": 9,
+  "note": "pair/source leakage means related content appears in multiple splits; this can inflate validation/test scores."
+}
